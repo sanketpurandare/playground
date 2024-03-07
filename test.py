@@ -2,23 +2,18 @@ from collections import defaultdict
 from typing import Any
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode, FakeTensor
-from torch.utils._pytree import tree_map_only
+from torch.utils._pytree import tree_map_only, tree_map
 import torchvision
 import torch.nn as nn
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils.weak import WeakIdKeyDictionary
 import weakref
 
+MB = 2 ** 20
 MEMORY_USE = WeakIdKeyDictionary()
 parents = ['Global']
 memory_tracking = defaultdict(lambda: defaultdict(int))
-# def update_stats():
-#     global parents
-#     curr_use = 0
-#     for k, v in MEMORY_USE.items():
-#         curr_use += k.nelement() * k.element_size()
-#     for par in parents:
-#         memory_tracking[par]
+
 
 
 def track(t):    
@@ -36,56 +31,100 @@ class MemoryTrackingMode(TorchDispatchMode):
         #     print("Result element size", res.element_size())
         #     print("Result device: ", res.device)
         tree_map_only(torch.Tensor, track, res)
-        global parents
-        curr_use = 0
-        for k, v in MEMORY_USE.items():
-            curr_use += k.nelement() * k.element_size()
-        for par in parents:
-            memory_tracking[par][func.__name__] = curr_use
-
-
         return res
 
-def enter_module(name:str):
+def normalize_tuple(x):
+    if not isinstance(x, tuple):
+        return (x,)
+    return x
+
+def get_current_memory_allocated()->int:
+    curr_use = 0
+    for k, v in MEMORY_USE.items():
+        curr_use += k.nelement() * k.element_size()
+    return curr_use
+
+def get_fqn()->str:
+    fqn = '.'.join(parents)
+    return fqn
+
+
+def create_backwards_push(name):
+    class PushState(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx: Any, *args: Any) -> Any:
+            args = tree_map(lambda x: x.clone() if isinstance(x, torch.Tensor) else x, args)
+            if len(args) == 1:
+                return args[0]
+            return args
+        
+        @staticmethod
+        def backward(ctx: Any, *grad_outputs: Any) -> Any:
+            global parents
+            parents.append(name)
+            fqn = get_fqn()
+            memory_tracking[fqn]["Before Backward"] = get_current_memory_allocated()
+            return grad_outputs
+    return PushState.apply
+
+def create_backwards_pop(name):
+    class PopState(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx: Any, *args: Any) -> Any:
+            args = tree_map(lambda x: x.clone() if isinstance(x, torch.Tensor) else x, args)
+            if len(args) == 1:
+                return args[0]
+            return args
+        
+        @staticmethod
+        def backward(ctx: Any, *grad_outputs: Any) -> Any:
+            global parents
+            fqn = get_fqn()
+            memory_tracking[fqn]["After Backward"] = get_current_memory_allocated()
+            assert(parents[-1] == name)
+            parents.pop()
+            return grad_outputs
+    return PopState.apply
+
+def enter_module_forward(name:str):
     def f (module:nn.Module, args:Any):
         global parents
         parents.append(name)
+        fqn = get_fqn()
+        memory_tracking[fqn]["Before Forward"] = get_current_memory_allocated()
+        args = normalize_tuple(args)
+        out = create_backwards_pop(name)(*args)
+        return out
     return f
 
-def exit_module(name:str):
-    def f (module:nn.Module, args: Any, output: Any):
+def exit_module_forward(name:str):
+    def f (module:nn.Module, args: Any, outputs: Any):
         global parents
         assert(parents[-1] == name)
+        fqn = get_fqn()
+        memory_tracking[fqn]["After Forward"] = get_current_memory_allocated()
         parents.pop()
+        outputs = normalize_tuple(outputs)
+        return create_backwards_push(name)(*outputs)
     return f
 
-def enter_module_backward(name:str):
-    def f (module:nn.Module, grad_output: Any):
-        global parents
-        parents.append(name)
-    return f
-
-def exit_module_backward(name:str):
-    def f (module:nn.Module, grad_input: Any, grad_output: Any):
-        global parents
-        assert(parents[-1] == name)
+def final_call():
+        fqn = get_fqn()
+        memory_tracking[fqn]["After Backward"] = get_current_memory_allocated()
         parents.pop()
-    return f
-
 
 
 def instrument_module(mod: nn.Module):
     for name, module in mod.named_children():
-        module.register_forward_pre_hook(enter_module(name))
-        module.register_forward_hook(exit_module(name))
-        # module.register_full_backward_pre_hook(enter_module_backward(name))
-        # module.register_full_backward_hook(exit_module_backward(name))
+        module.register_forward_pre_hook(enter_module_forward(name))
+        module.register_forward_hook(exit_module_forward(name))
+
 
 def display_mem_stats():
     for mod in memory_tracking.keys():
         print(f"Module: ", mod)
         for k,v in memory_tracking[mod].items():
-            print(k, v)
+            print(f"{k}: {round(v/MB,2)} MBs")
         print()
 
 def experiment():
@@ -98,6 +137,7 @@ def experiment():
         input = torch.randn(256, 3, 224, 224)
         output = model(input)
         output.sum().backward()
+        final_call()
     display_mem_stats()
 
 if __name__ == "__main__":
