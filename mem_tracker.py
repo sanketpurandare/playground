@@ -1,223 +1,311 @@
+import math
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, Dict
+from enum import Enum
+from typing import Any, Dict, List, NamedTuple, Optional, Union
+
 import torch
-import math
-from torch._subclasses.fake_tensor import FakeTensorMode, FakeTensor
-from torch.utils._pytree import tree_map_only, tree_map
-import torchvision
 import torch.nn as nn
 from torch.utils._python_dispatch import TorchDispatchMode
+from torch.utils._pytree import tree_map_only
+from torch.utils.hooks import RemovableHandle
 from torch.utils.weak import WeakIdKeyDictionary
-import weakref
-from enum import Enum
 
-MB = 2 ** 20
-KB = 2 ** 10
-MEMORY_MAX = 0
-PYTORCH_MIN_ALLOCATE = 2**9
-MEMORY_USE = WeakIdKeyDictionary()
-FIRST_OPT_ITER = True
-parents = []
-memory_tracking = defaultdict(lambda: defaultdict(lambda: defaultdict()))
+_PYTORCH_MIN_ALLOCATE = 2**9
 
-class RefType(str, Enum):
-    parameter = 'parameter'
-    buffer = 'buffer'
-    gradient = 'gradient'
-    activation = 'activation'
-    optstate = 'optstate'
+__all__ = ["MemoryTrackingMode"]
+
+
+class _RefType(str, Enum):
+    parameter = "parameter"
+    unsharded_parameter = "unsharded_parameter"
+    buffer = "buffer"
+    gradient = "gradient"
+    unsharded_gradient = "unsharded_gradient"
+    activation = "activation"
+    optstate = "optstate"
+
+
 @dataclass
-class WeakRefInfo():
-    def __init__(self, numel:int, element_size:int, reftype: RefType) -> None:
-        self.numel = numel
+class _WeakRefInfo:
+    def __init__(self, size: int, element_size: int, reftype: _RefType) -> None:
+        self.size = size
         self.element_size = element_size
         self.reftype = reftype
-        self.mem_consumed = math.ceil((self.numel * self.element_size)/PYTORCH_MIN_ALLOCATE)*PYTORCH_MIN_ALLOCATE
+        self.mem_consumed = self._calculate_mem_consumed()
 
-    def get_mem_consumed(self)->int:
+    def _calculate_mem_consumed(self)->int:
+        return (math.ceil((self.size * self.element_size) / _PYTORCH_MIN_ALLOCATE)
+            * _PYTORCH_MIN_ALLOCATE)
+
+    def get_mem_consumed(self, st: torch.UntypedStorage) -> int:
+        if st.size() != self.size:
+            self.size = st.size()
+            self.mem_consumed = self._calculate_mem_consumed()
         return self.mem_consumed
 
-WINFO:Dict[weakref.ref, WeakRefInfo] = WeakIdKeyDictionary()
 
-def update_stats():
-    global MEMORY_MAX, WINFO
-    curr_use = 0
-    for k, v in MEMORY_USE.items():
-        curr_use += WINFO[k].get_mem_consumed()
+class _ModuleHookHandles(NamedTuple):
+    forward_pre_hook_handle: RemovableHandle
+    forward_hook_handle: RemovableHandle
+    backward_pre_hook_handle: RemovableHandle
+    backward_hook_handle: RemovableHandle
 
-    if MEMORY_MAX < curr_use:
-        MEMORY_MAX = curr_use
-
-def track(t):
-    def cb(_):
-        update_stats()      
-    reftype = RefType.activation
-    if isinstance(t, nn.Parameter):
-        reftype = RefType.parameter
-    st = t.untyped_storage()
-    wt = weakref.ref(st, cb)
-    winfo = WeakRefInfo(st.size(), st.element_size(), reftype)
-    WINFO[st] = winfo
-    MEMORY_USE[st] = wt
-    update_stats()
 
 class MemoryTrackingMode(TorchDispatchMode):
-    def __torch_dispatch__(self, func, types, args=..., kwargs=None):
+    def __init__(
+        self,
+        mod: Optional[torch.nn.Module] = None,
+        optm: Optional[torch.optim.Optimizer] = None,
+        depth: int = 2,
+        units: str = "B",
+        display_modulewise_stats: bool = True,
+    ):
+        self.mod = mod
+        self.optm = optm
+        self.depth = depth
+        self.units = units
+        self.display_modulewise_stats = display_modulewise_stats
+        self.memory_tracking: Dict[str, Dict[str, Dict[str, int]]] = defaultdict(
+            lambda: defaultdict(defaultdict)
+        )
+        self.parents: List[str] = []
+        self._MEMORY_MAX: int = 0
+        self.FIRST_OPT_ITER: bool = True
+        self._module_to_hook_handles: Dict[nn.Module, _ModuleHookHandles] = {}
+        self._param_to_grad_hook_handles: Dict[nn.Parameter, RemovableHandle] = {}
+        self._optimizer_hook_handle: Union[RemovableHandle, None] = None
+        self.WINFO = WeakIdKeyDictionary()
 
+    def _update_stats(self):
+        curr_use: int = 0
+        for st, winfo in self.WINFO.items():
+            curr_use += winfo.get_mem_consumed(st)
+
+        if self._MEMORY_MAX < curr_use:
+            self._MEMORY_MAX = curr_use
+
+    def _track(self, t: torch.Tensor):
+        st = t.untyped_storage()
+        if self.WINFO.get(st, None) is not None:
+            return
+        winfo = _WeakRefInfo(st.size(), st.element_size(), _RefType.activation)
+        self.WINFO[st] = winfo
+        self._update_stats()
+
+    def _get_current_memory_allocated(self) -> Dict[str, int]:
+        mem_stats = defaultdict(int)
+        mem_stats[_RefType.parameter.name] = 0
+        mem_stats[_RefType.unsharded_parameter.name] = 0
+        mem_stats[_RefType.gradient.name] = 0
+        mem_stats[_RefType.unsharded_gradient.name] = 0
+        mem_stats[_RefType.optstate.name] = 0
+        mem_stats[_RefType.activation.name] = 0
+        mem_stats[_RefType.buffer.name] = 0
+        for st, winfo in self.WINFO.items():
+            mem_stats[winfo.reftype.name] += winfo.get_mem_consumed(st)
+        mem_stats["TRACKER_total"] = sum([m for m in mem_stats.values()])
+        if torch.cuda.is_available():
+            mem_stats["CUDA_total"] = torch.cuda.memory_allocated()
+        return mem_stats
+
+    def print_mem_stats(self, stats: Optional[Dict[str, int]] = None):
+        if stats is None:
+            stats = self._get_current_memory_allocated()
+        rounding_fn = lambda x, y, z: round(x / y, z)
+        if self.units == "MB":
+            divisor = 2**20
+        elif self.units == "KB":
+            divisor = 2**10
+        else:
+            divisor = 1
+            rounding_fn = lambda x, y, z: x
+        for mem_type, mem_val in stats.items():
+            print(f"\t{mem_type}: {rounding_fn(mem_val, divisor, 2)} {self.units}")
+
+    def get_max_memory(self) -> int:
+        return self._MEMORY_MAX
+
+    def _display_mem_stats(self, depth=None):
+        if depth is None:
+            depth = self.depth
+        for mod in self.memory_tracking.keys():
+            mod_depth = mod.count(".") + 1
+            if mod_depth > depth:
+                continue
+            print(f"Module: ", mod)
+            for state, stats in self.memory_tracking[mod].items():
+                print(f"{state}")
+                self.print_mem_stats(stats)
+            print()
+
+    def _enter_module(self, name: str, state: str):
+        def f(module: nn.Module, args: Any):
+            self.parents.append(name)
+            self.memory_tracking[name][state] = self._get_current_memory_allocated()
+
+        return f
+
+    def _exit_module(self, name: str, state: str):
+        def f(module: nn.Module, args: Any, outputs: Any):
+            assert self.parents[-1] == name, f"{self.parents[-1]} is not {name}"
+            self.memory_tracking[name][state] = self._get_current_memory_allocated()
+            self.parents.pop()
+
+        return f
+
+    def _register_module_hooks(self, name: str, module: nn.Module):
+        fwd_pre_hook_handle = module.register_forward_pre_hook(
+            self._enter_module(name, "Before Forward")
+        )
+        fwd_hook_handle = module.register_forward_hook(
+            self._exit_module(name, "After Forward")
+        )
+        bwd_pre_hook_handle = module.register_full_backward_pre_hook(
+            self._enter_module(name, "Before Backward")
+        )
+        bwd_hook_handle = module.register_full_backward_hook(
+            self._exit_module(name, "After Backward")
+        )
+        self._module_to_hook_handles[module] = _ModuleHookHandles(
+            fwd_pre_hook_handle, fwd_hook_handle, bwd_pre_hook_handle, bwd_hook_handle
+        )
+
+    def _instrument_module(self, mod: nn.Module):
+        prefix = type(mod).__name__
+        for name, module in mod.named_modules():
+            if name == "":
+                name = prefix
+            else:
+                name = ".".join([prefix, name])
+            if hasattr(module, "inplace") and getattr(module, "inplace"):
+                setattr(module, "inplace", False)
+            self._register_module_hooks(name, module)
+
+        def _grad_hook(param: nn.Parameter):
+            if param is not None and param.grad is not None:
+                st = param.grad.untyped_storage()
+                winfo = self.WINFO.get(st, None)
+                assert winfo is not None, "grad tensor not found in WINFO"
+                winfo.reftype = _RefType.gradient
+
+        for param in mod.parameters():
+            st = param.untyped_storage()
+            winfo = self.WINFO.get(st, None)
+            if winfo is None:
+                winfo = _WeakRefInfo(st.size(), st.element_size(), _RefType.parameter)
+                self.WINFO[st] = winfo
+            grad_hook_handle = param.register_post_accumulate_grad_hook(_grad_hook)
+            self._param_to_grad_hook_handles[param] = grad_hook_handle
+
+        for buffer in mod.buffers():
+            st = buffer.untyped_storage()
+            winfo = self.WINFO.get(st, None)
+            if winfo is None:
+                winfo = _WeakRefInfo(st.size(), st.element_size(), _RefType.buffer)
+                self.WINFO[st] = winfo
+
+    def _instrument_optimizer(self, optim: torch.optim.Optimizer):
+        def _opt_state(
+            optimizer: torch.optim.Optimizer, args: Any, kwargs: Any
+        ) -> None:
+            if self.FIRST_OPT_ITER:
+                for states in optimizer.state.values():
+                    for val in states.values():
+                        if isinstance(val, torch.Tensor):
+                            winfo = self.WINFO[val.untyped_storage()]
+                            assert (
+                                winfo is not None
+                            ), "opt state tensor not found in WINFO"
+                            winfo.reftype = _RefType.optstate
+                self.FIRST_OPT_ITER = False
+
+        opt_hook_handle = optim.register_step_post_hook(_opt_state)
+        self._optimizer_hook_handle = opt_hook_handle
+
+    def _register_module_and_optimizer_hooks(self):
+        if self.mod is not None:
+            self._instrument_module(self.mod)
+        if self.optm is not None:
+            self._instrument_optimizer(self.optm)
+
+    def _deregister_module_and_optimizer_hooks(self):
+        for module_hook_handles in self._module_to_hook_handles.values():
+            module_hook_handles.forward_pre_hook_handle.remove()
+            module_hook_handles.forward_hook_handle.remove()
+            module_hook_handles.backward_pre_hook_handle.remove()
+            module_hook_handles.backward_hook_handle.remove()
+
+        for grad_hook_handle in self._param_to_grad_hook_handles.values():
+            grad_hook_handle.remove()
+
+        if self._optimizer_hook_handle is not None:
+            self._optimizer_hook_handle.remove()
+
+    def __enter__(self):
+        self._register_module_and_optimizer_hooks()
+        super().__enter__()
+        return self
+
+    def __exit__(self, *args):
+        if self.display_modulewise_stats:
+            self._display_mem_stats()
+        self._deregister_module_and_optimizer_hooks()
+        super().__exit__(*args)
+
+    def __torch_dispatch__(self, func, types, args=..., kwargs=None):
         res = func(*args, **kwargs or {})
-        tree_map_only(torch.Tensor, track, res)
+        tree_map_only(torch.Tensor, self._track, res)
         return res
 
-def normalize_tuple(x):
-    if not isinstance(x, tuple):
-        return (x,)
-    return x
 
-def get_current_memory_allocated()->Dict[str, float]:
-    global MEMORY_USE, WINFO
-    mem_stats = defaultdict(float)
-    mem_stats[RefType.parameter] = 0
-    mem_stats[RefType.gradient] = 0
-    mem_stats[RefType.optstate] = 0
-    mem_stats[RefType.activation] = 0
-    mem_stats[RefType.buffer] = 0
-    for k, v in MEMORY_USE.items():
-        winfo = WINFO[k]
-        mem_stats[winfo.reftype] += winfo.get_mem_consumed()
-    mem_stats['total'] = sum([m for m in mem_stats.values()])
-    return mem_stats
+def test():
+    class DummyModel(nn.Module):
+        def __init__(self, layers: int, dim: int):
+            super(DummyModel, self).__init__()
+            self._module_list = []
+            for _ in range(layers):
+                self._module_list.extend([nn.Linear(dim, dim), nn.ReLU()])
+            self.module = nn.Sequential(*self._module_list)
 
-def get_fqn()->str:
-    fqn = '.'.join(parents)
-    return fqn
+        def forward(self, x):
+            return self.module(x)
 
+    batch_size = 100
+    layers = 5
+    dim = 10000
+    if torch.cuda.is_available():
+        torch.set_default_device("cuda")
+        torch.cuda.reset_peak_memory_stats()
 
-def enter_module_forward(name:str):
-    @torch.no_grad
-    def f (module:nn.Module, args:Any):
-        global parents
-        parents.append(name)
-        fqn = get_fqn()
-        memory_tracking[fqn]["Before Forward"] = get_current_memory_allocated()
-    return f
-
-def exit_module_forward(name:str):
-    @torch.no_grad
-    def f (module:nn.Module, args: Any, outputs: Any):
-        global parents
-        assert(parents[-1] == name)
-        fqn = get_fqn()
-        memory_tracking[fqn]["After Forward"] = get_current_memory_allocated()
-        parents.pop()
-    return f
-
-def enter_module_backward(name:str):
-    @torch.no_grad
-    def f (module:nn.Module, grad_output:Any):
-        global parents
-        parents.append(name)
-        fqn = get_fqn()
-        memory_tracking[fqn]["Before Backward"] = get_current_memory_allocated()
-    return f
-
-def exit_module_backward(name:str):
-    @torch.no_grad
-    def f (module:nn.Module, grad_input: Any, grad_output: Any):
-        global parents
-        assert(parents[-1] == name)
-        fqn = get_fqn()
-        memory_tracking[fqn]["After Backward"] = get_current_memory_allocated()
-        parents.pop()
-    return f
-
-def final_call():
-        fqn = get_fqn()
-        memory_tracking[fqn]["After Backward"] = get_current_memory_allocated()
-        parents.pop()
-
-def register_hooks(name:str, module:nn.Module):
-        module.register_forward_pre_hook(enter_module_forward(name))
-        module.register_forward_hook(exit_module_forward(name))
-        module.register_full_backward_pre_hook(enter_module_backward(name))
-        if(name == "Root"):
-            return
-        module.register_full_backward_hook(exit_module_backward(name))
-
-def instrument_module(mod: nn.Module):
-
-    register_hooks("Root", mod)
-    for name, module in mod.named_children():
-        if hasattr(module, 'inplace') and  getattr(module, 'inplace'):
-            setattr(module, 'inplace', False)
-        register_hooks(name, module)
-    
-    def grad_hook(param: nn.Parameter):
-        global WINFO
-        winfo = WINFO[param.grad.untyped_storage()]
-        assert winfo is not None, "grad tensor not found in WINFO"
-        winfo.reftype = RefType.gradient
-
-    for param in mod.parameters():
-        param.register_post_accumulate_grad_hook (grad_hook)
-        winfo = WINFO[param.untyped_storage()]
-        assert winfo is not None, "param tensor not found in WINFO"
-        winfo.reftype = RefType.parameter
-
-    for buffer in mod.buffers():
-        winfo = WINFO[buffer.untyped_storage()]
-        assert winfo is not None, "buffer not found in WINFO"
-        winfo.reftype = RefType.buffer
-
-
-def instrument_optimizer(optim:torch.optim.Optimizer):
-
-    def outopt(optimizer:torch.optim.Optimizer, args:Any, kwargs:Any)->None:
-        global FIRST_OPT_ITER, WINFO, MEMORY_USE
-        if FIRST_OPT_ITER:
-            for param, states in optimizer.state.items():
-                for val in states.values():
-                    if isinstance(val, torch.Tensor):
-                        winfo = WINFO[val.untyped_storage()]
-                        assert winfo is not None, "opt state tensor not found in WINFO"
-                        winfo.reftype = RefType.optstate
-            FIRST_OPT_ITER = False            
-    post_handle = optim.register_step_post_hook(outopt)
-
-def print_mem_stats(stats:Dict[str, int]):
-    for type, mem in stats.items():
-        print(f"\t{type}: {round(mem/MB, 2)} MBs")
-
-def display_mem_stats():
-    for mod in memory_tracking.keys():
-        print(f"Module: ", mod)
-        for k,stats in memory_tracking[mod].items():
-            print(f"{k}")
-            print_mem_stats(stats)
-        print()
-
-def experiment():
-    fake_mode = FakeTensorMode()
-    mem_tracker = MemoryTrackingMode()
-    torch.set_default_device("cuda")
-    torch.cuda.reset_peak_memory_stats()
-    with fake_mode, mem_tracker:
-        model = torchvision.models.resnet18()
-        optim = torch.optim.Adam(model.parameters())
-        instrument_module(model)
-        instrument_optimizer(optim)
-        input = torch.randn(256, 3, 224, 224)
-        output = model(input)
+    model = DummyModel(layers, dim)
+    optim = torch.optim.Adam(model.parameters(), fused=True)
+    mem_tracker = MemoryTrackingMode(model, optim, display_modulewise_stats=True)
+    with mem_tracker as mt:
+        input_batch = torch.randn(batch_size, dim)
+        print(f"After Model and mini-batch init:")
+        mt.print_mem_stats()
+        output = model(input_batch)
+        print(f"After Forward:")
+        mt.print_mem_stats()
         output.sum().backward()
-        final_call()
+        output = None
+        print(f"After Backward:")
+        mt.print_mem_stats()
         optim.step()
+        print(f"After Opt Step:")
+        mt.print_mem_stats()
         optim.zero_grad()
-  
-    display_mem_stats()
-    print(f"Tracker measured: {MEMORY_MAX}")
-    print(f"CUDA measured: {torch.cuda.max_memory_allocated()}")
+        print(f"After Zero Grad:")
+        mt.print_mem_stats()
+        MAX_MEMORY = mt.get_max_memory()
+
+    print(f"Tracker measured: {MAX_MEMORY}")
+    if torch.cuda.is_available():
+        CUDA_MEMORY_MAX = torch.cuda.max_memory_allocated()
+        print(f"Cuda measured: {CUDA_MEMORY_MAX}")
+        print(f"Peak comparison ratio: {MAX_MEMORY/CUDA_MEMORY_MAX}")
 
 
 if __name__ == "__main__":
-    experiment()
-
+    test()
