@@ -11,22 +11,26 @@ from torch.testing._internal.distributed.fake_pg import FakeStore
 from torch._subclasses.fake_tensor import FakeTensorMode, FakeTensor
 from torch.utils._python_dispatch import TorchDispatchMode
 import logging
+
 aten = torch.ops.aten
 from torch.distributed._functional_collectives import all_gather_tensor_inplace
 import torch.distributed._functional_collectives_impl as func_col_impl
+
 func_col_impl._use_native_funcol = True
+
+
 class IgnoreDistMode(TorchDispatchMode):
     def __torch_dispatch__(self, func, types, args=..., kwargs=None):
         logging.info(str(func.__name__))
         logging.info(type(func))
         logging.info(func)
-        
-        if(func == torch.ops.c10d._allgather_base_.default):
+
+        if func == torch.ops.c10d._allgather_base_.default:
             logging.info(str(func.__name__))
             logging.info(type(func))
             logging.info(func)
             logging.info(f"Arg types: {[type(arg) for arg in args]}")
-           
+
             logging.info(f"Torch Script Inp Obj: {ProcessGroup.unbox(args[2])}")
             # func = torch.ops._c10d_functional.all_gather_into_tensor.default
             res = func(*args, **kwargs or {})
@@ -49,18 +53,21 @@ class IgnoreDistMode(TorchDispatchMode):
         #     print("Result device: ", res.device)
         return res
 
+
 class FakeWork(Work):
     def get_future(self) -> Future:
-        future =  Future()
+        future = Future()
         future.set_result(None)
         return future
-    
+
     def wait(self, timeout: timedelta = ...) -> bool:
         return True
 
-def all_gather_into_tensor(out_tensor: torch.Tensor, in_tensor:torch.Tensor):
+
+def all_gather_into_tensor(out_tensor: torch.Tensor, in_tensor: torch.Tensor):
     # work = FakeWork()
     return None
+
 
 @contextmanager
 def bypass_collectives():
@@ -72,24 +79,29 @@ def bypass_collectives():
     finally:
         dist.all_gather_into_tensor = saved_all_gather
 
+
 def run_worker(rank, world_size):
-    logging.getLogger().setLevel(logging.DEBUG if rank == 0 else logging.CRITICAL)
+    logging.getLogger().setLevel(
+        logging.DEBUG if rank == 0 else logging.CRITICAL
+    )
     # logging.getLogger().setLevel(logging.DEBUG)
     store = FakeStore()
-    dist.init_process_group("fake", rank=rank, world_size=world_size, store=store)
+    dist.init_process_group(
+        "fake", rank=rank, world_size=world_size, store=store
+    )
     logging.info(f"Number of visible devices:  {torch.cuda.device_count()}")
     torch.cuda.set_device(rank)
-    
+
     with FakeTensorMode() as fake_mode:
         with bypass_collectives():
-            with  IgnoreDistMode():
+            with IgnoreDistMode():
 
-                test_tensor = torch.randn(100, device='cuda')
-                output_tensor = torch.empty(test_tensor.numel()*world_size, device='cuda')
+                test_tensor = torch.randn(100, device="cuda")
+                output_tensor = torch.empty(
+                    test_tensor.numel() * world_size, device="cuda"
+                )
                 # all_gather_tensor_inplace(output_tensor, test_tensor, dist.group.WORLD)
                 dist.all_gather_into_tensor(output_tensor, test_tensor)
-
-
 
 
 if __name__ == "__main__":
