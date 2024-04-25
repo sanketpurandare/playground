@@ -203,6 +203,10 @@ def apply_fsdp_wrapping(
     return model
 
 
+vocab_size = 50304
+n_layer = 12
+
+
 def test_memory_tracking(
     use_activation_checkpoint: bool,
     use_cpu_offload: bool,
@@ -213,8 +217,8 @@ def test_memory_tracking(
         rank = dist.get_rank()
     except:
         rank = 0
-    vocab_size = 50304
-    config = GPTConfig(block_size=2048, n_layer=12, vocab_size=vocab_size)
+
+    config = GPTConfig(block_size=2048, n_layer=n_layer, vocab_size=vocab_size)
 
     model = meta_init_model(config)
     model = apply_fsdp_wrapping(
