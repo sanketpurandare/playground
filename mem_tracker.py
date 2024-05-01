@@ -1,29 +1,25 @@
 import math
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import timedelta
 from enum import Enum
-from typing import (
-    Any,
-    Callable,
-    Dict,
-    List,
-    NamedTuple,
-    Optional,
-    Union,
-    Tuple,
-)
-from functools import partial, wraps
+from functools import wraps
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Union
+
 import torch
+import torch.distributed as dist
 import torch.nn as nn
+from torch._C._distributed_c10d import Work
+from torch._guards import active_fake_mode
+from torch.distributed._composable.fsdp import FSDP
+from torch.distributed._composable.fsdp._fsdp_param_group import (
+    FSDPCommContext, FSDPParamGroup)
+from torch.distributed._tensor.api import DTensor
+from torch.futures import Future
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_map_only
 from torch.utils.hooks import RemovableHandle
 from torch.utils.weak import WeakIdKeyDictionary
-from torch.distributed._composable.fsdp._fsdp_param_group import (
-    FSDPCommContext,
-    FSDPParamGroup,
-)
-from torch.distributed._composable.fsdp import FSDP
 
 _PYTORCH_MIN_ALLOCATE = 2**9
 
@@ -38,6 +34,7 @@ class _RefType(str, Enum):
     unsharded_gradient = "unsharded_gradient"
     activation = "activation"
     all_gather = "all_gather"
+    all_gather_copy_in = "all_gather_copy_in"
     reduce_scatter = "reduce_scatter"
     optstate = "optstate"
     inputs = "inputs"
@@ -73,20 +70,25 @@ class _FSDPParamGroupSavedMethods(NamedTuple):
     post_backward: Callable
 
 
+class _CollectiveSavedMethods(NamedTuple):
+    all_gather_into_tensor: Callable
+    reduce_scatter_tensor: Callable
+    all_reduce: Callable
+    barrier: Callable
+
+
 class MemoryTrackingMode(TorchDispatchMode):
     def __init__(
         self,
         mod: Optional[torch.nn.Module] = None,
         optm: Optional[torch.optim.Optimizer] = None,
         inputs: Optional[Any] = None,
-        depth: int = 2,
         units: str = "B",
         display_modulewise_stats: bool = True,
     ):
         self.mod = mod
         self.optm = optm
         self.inputs = inputs
-        self.depth = depth
         self.units = units
         self.display_modulewise_stats = display_modulewise_stats
         self.pre_forward_order: List[FSDPParamGroup] = []
@@ -98,17 +100,32 @@ class MemoryTrackingMode(TorchDispatchMode):
         self._MEMORY_MAX: int = 0
         self.FIRST_OPT_ITER: bool = True
         self._RECORD_PRE_FORWARD_ORDER: bool = False
+        self._IN_FAKE_MODE: bool = False
         self._fsdp_param_group_to_saved_methods: Dict[
             FSDPParamGroup, _FSDPParamGroupSavedMethods
         ] = {}
-        self._sharded_param_to_grad_hook_handles: Dict[
-            nn.Parameter, RemovableHandle
-        ] = {}
+        self._collective_saved_methods: _CollectiveSavedMethods
         self._unsharded_param_to_grad_hook_handles: Dict[
             nn.Parameter, RemovableHandle
         ] = {}
         self._optimizer_hook_handle: Union[RemovableHandle, None] = None
         self.WINFO = WeakIdKeyDictionary()
+
+    def _update_and_maybe_create_winfo(
+        self, t: torch.Tensor, reftype: _RefType, existing: bool = False
+    ) -> bool:
+        if isinstance(t, DTensor):
+            t = t._local_tensor
+        st = t.untyped_storage()
+        winfo = self.WINFO.get(st, None)
+        if winfo is None:
+            if existing:
+                return False
+            winfo = _WeakRefInfo(st.size(), st.element_size(), reftype)
+            self.WINFO[st] = winfo
+        else:
+            winfo.reftype = reftype
+        return True
 
     def _update_stats(self):
         curr_use: int = 0
@@ -119,6 +136,8 @@ class MemoryTrackingMode(TorchDispatchMode):
             self._MEMORY_MAX = curr_use
 
     def _track(self, t: torch.Tensor):
+        if isinstance(t, DTensor):
+            t = t._local_tensor
         st = t.untyped_storage()
         if self.WINFO.get(st, None) is not None:
             return
@@ -134,7 +153,9 @@ class MemoryTrackingMode(TorchDispatchMode):
             mem_stats[winfo.reftype.name] += winfo.get_mem_consumed(st)
         mem_stats["TRACKER_total"] = sum([m for m in mem_stats.values()])
         if torch.cuda.is_available():
-            mem_stats["CUDA_total"] = torch.cuda.memory_allocated()
+            mem_stats["CUDA_total"] = torch.cuda.memory_stats()[
+                "active_bytes.all.current"
+            ]
         return mem_stats
 
     def print_mem_stats(self, stats: Optional[Dict[str, int]] = None):
@@ -163,13 +184,8 @@ class MemoryTrackingMode(TorchDispatchMode):
     def get_max_memory(self) -> int:
         return self._MEMORY_MAX
 
-    def _display_mem_stats(self, depth=None):
-        if depth is None:
-            depth = self.depth
+    def _display_mem_stats(self):
         for mod in self.memory_tracking.keys():
-            mod_depth = mod.count(".") + 1
-            if mod_depth > depth:
-                continue
             print(f"Module:  {mod}")
             for state, stats in self.memory_tracking[mod].items():
                 print(f"{state}")
@@ -190,45 +206,28 @@ class MemoryTrackingMode(TorchDispatchMode):
         self.parents.pop()
 
     def _instrument_fsdp_param_group(self, fsdp_param_group: FSDPParamGroup):
-        def _grad_hook(reftype: _RefType, param: nn.Parameter):
+        def _unsharded_grad_hook(param: nn.Parameter):
             if param.grad is not None:
-                st = param.grad.untyped_storage()
-                winfo = self.WINFO.get(st, None)
-                assert winfo is not None, "grad tensor not found in WINFO"
-                winfo.reftype = reftype
-
-        _sharded_grad_hook = partial(_grad_hook, _RefType.sharded_gradient)
-        _unsharded_grad_hook = partial(_grad_hook, _RefType.unsharded_gradient)
+                assert self._update_and_maybe_create_winfo(
+                    param.grad, _RefType.unsharded_gradient, existing=True
+                ), "grad tensor not found in WINFO"
 
         for fsdp_param in fsdp_param_group.fsdp_params:
             assert isinstance(fsdp_param.sharded_param, nn.Parameter), (
                 f"{fsdp_param._module_info.param_name} sharded param is not a"
                 " nn.Parameter"
             )
-            st = fsdp_param.sharded_param.untyped_storage()
-            winfo = self.WINFO.get(st, None)
-            if winfo is None:
-                winfo = _WeakRefInfo(
-                    st.size(), st.element_size(), _RefType.sharded_parameter
-                )
-                self.WINFO[st] = winfo
-            self._sharded_param_to_grad_hook_handles[
-                fsdp_param.sharded_param
-            ] = fsdp_param.sharded_param.register_post_accumulate_grad_hook(
-                _sharded_grad_hook
+            self._update_and_maybe_create_winfo(
+                fsdp_param.sharded_param, _RefType.sharded_parameter
             )
 
             assert isinstance(fsdp_param._unsharded_param, nn.Parameter), (
                 f"{fsdp_param._module_info.param_name} unsharded param is not"
                 " a nn.Parameter"
             )
-            st = fsdp_param._unsharded_param.untyped_storage()
-            winfo = self.WINFO.get(st, None)
-            if winfo is None:
-                winfo = _WeakRefInfo(
-                    st.size(), st.element_size(), _RefType.unsharded_parameter
-                )
-                self.WINFO[st] = winfo
+            self._update_and_maybe_create_winfo(
+                fsdp_param._unsharded_param, _RefType.unsharded_parameter
+            )
             self._unsharded_param_to_grad_hook_handles[
                 fsdp_param._unsharded_param
             ] = fsdp_param._unsharded_param.register_post_accumulate_grad_hook(
@@ -249,17 +248,6 @@ class MemoryTrackingMode(TorchDispatchMode):
         def inner(*args, **kwargs):
             self._enter_module(name, "Before Pre-Forward")
             args, kwargs = orig_fsdp_param_group_pre_forward(*args, **kwargs)
-            if (
-                all_gather_result := fsdp_param_group._all_gather_result
-            ) is not None:
-                assert isinstance(
-                    all_gather_result, torch.Tensor
-                ), "Expected all gather result to be a tensor"
-                winfo = self.WINFO[all_gather_result.untyped_storage()]
-                assert (
-                    winfo is not None
-                ), "all gather tensor not found in WINFO"
-                winfo.reftype = _RefType.all_gather
             self._exit_module(name, "After Pre-Forward")
             return args, kwargs
 
@@ -305,6 +293,12 @@ class MemoryTrackingMode(TorchDispatchMode):
         def inner(*args, **kwargs):
             self._enter_module(name, "Before Post-Backward")
             ret_val = orig_fsdp_param_group_post_backward(*args, **kwargs)
+            for fsdp_param in fsdp_param_group.fsdp_params:
+                sharded_grad = fsdp_param.sharded_param.grad
+                if sharded_grad is not None:
+                    assert self._update_and_maybe_create_winfo(
+                        sharded_grad, _RefType.sharded_gradient
+                    ), "sharded grad failed"
             self._exit_module(name, "After Post-Backward")
             return ret_val
 
@@ -317,10 +311,12 @@ class MemoryTrackingMode(TorchDispatchMode):
             if isinstance(module, FSDP):
                 state = module._get_fsdp_state()
                 if fsdp_param_group := state._fsdp_param_group:
+                    local_prefix = type(module).__name__
                     if name == "":
                         name = prefix
                     else:
-                        name = ".".join([prefix, name])
+                        local_prefix = type(module).__name__
+                        name = ".".join([prefix, local_prefix + "_" + name])
 
                     self._instrument_fsdp_param_group(fsdp_param_group)
                     self._fsdp_param_group_to_saved_methods[
@@ -360,13 +356,7 @@ class MemoryTrackingMode(TorchDispatchMode):
                         )
                     )
         for buffer in mod.buffers():
-            st = buffer.untyped_storage()
-            winfo = self.WINFO.get(st, None)
-            if winfo is None:
-                winfo = _WeakRefInfo(
-                    st.size(), st.element_size(), _RefType.buffer
-                )
-                self.WINFO[st] = winfo
+            self._update_and_maybe_create_winfo(buffer, _RefType.buffer)
 
     def _instrument_optimizer(self, optim: torch.optim.Optimizer):
         def _opt_state(
@@ -376,17 +366,9 @@ class MemoryTrackingMode(TorchDispatchMode):
                 for states in optimizer.state.values():
                     for val in states.values():
                         if isinstance(val, torch.Tensor):
-                            st = val.untyped_storage()
-                            winfo = self.WINFO.get(st, None)
-                            if winfo is None:
-                                winfo = _WeakRefInfo(
-                                    st.size(),
-                                    st.element_size(),
-                                    _RefType.optstate,
-                                )
-                                self.WINFO[st] = winfo
-                            else:
-                                winfo.reftype = _RefType.optstate
+                            self._update_and_maybe_create_winfo(
+                                val, _RefType.optstate
+                            )
                 self.FIRST_OPT_ITER = False
 
         _opt_state(optim, None, None)
@@ -411,11 +393,6 @@ class MemoryTrackingMode(TorchDispatchMode):
             fsdp_param_group.post_backward = saved_methods.post_backward
 
         for (
-            sharded_grad_hook_handle
-        ) in self._sharded_param_to_grad_hook_handles.values():
-            sharded_grad_hook_handle.remove()
-
-        for (
             unsharded_grad_hook_handle
         ) in self._unsharded_param_to_grad_hook_handles.values():
             unsharded_grad_hook_handle.remove()
@@ -423,23 +400,122 @@ class MemoryTrackingMode(TorchDispatchMode):
         if self._optimizer_hook_handle is not None:
             self._optimizer_hook_handle.remove()
 
+    def _instrument_and_maybe_bypass_collectives(self):
+        self._collective_saved_methods = _CollectiveSavedMethods(
+            dist.all_gather_into_tensor,
+            dist.reduce_scatter_tensor,
+            dist.all_reduce,
+            dist.barrier,
+        )
+
+        class FakeWork(Work):
+
+            def __init__(self):
+                super().__init__()
+
+            def get_future(self) -> Future:
+                future = Future()
+                future.set_result(None)
+                return future
+
+            def wait(self, timeout: timedelta = ...) -> bool:
+                return True
+
+        @wraps(dist.all_gather_into_tensor)
+        def all_gather_into_tensor(
+            output_tensor: torch.Tensor,
+            input_tensor: torch.Tensor,
+            group=None,
+            async_op=False,
+        ):
+            assert self._update_and_maybe_create_winfo(
+                input_tensor, _RefType.all_gather_copy_in, existing=True
+            ), "all_gather_in_tensor not found in WINFO"
+            assert self._update_and_maybe_create_winfo(
+                output_tensor, _RefType.all_gather, existing=True
+            ), "all_gather_out_tensor not found in WINFO"
+
+            if self._IN_FAKE_MODE:
+                if async_op:
+                    return FakeWork()
+                return None
+            else:
+                return self._collective_saved_methods.all_gather_into_tensor(
+                    output_tensor, input_tensor, group, async_op
+                )
+
+        @wraps(dist.reduce_scatter_tensor)
+        def reduce_scatter_tensor(
+            output: torch.Tensor,
+            input: torch.Tensor,
+            op: dist.ReduceOp = dist.ReduceOp.SUM,
+            group=None,
+            async_op=False,
+        ):
+            assert self._update_and_maybe_create_winfo(
+                input, _RefType.reduce_scatter, existing=True
+            ), "reduce_scatter_in_tensor not found in WINFO"
+
+            if self._IN_FAKE_MODE:
+                if async_op:
+                    return FakeWork()
+                return None
+            else:
+                return self._collective_saved_methods.reduce_scatter_tensor(
+                    output, input, op, group, async_op
+                )
+
+        @wraps(dist.all_reduce)
+        def all_reduce(
+            tensor: torch.Tensor,
+            op: dist.ReduceOp = dist.ReduceOp.SUM,
+            group=None,
+            async_op=False,
+        ):
+            if self._IN_FAKE_MODE:
+                if async_op:
+                    return FakeWork()
+                return None
+            else:
+                return self._collective_saved_methods.all_reduce(
+                    tensor, op, group, async_op
+                )
+
+        @wraps(dist.barrier)
+        def barrier():
+            if self._IN_FAKE_MODE:
+                return None
+            else:
+                return self._collective_saved_methods.barrier()
+
+        dist.all_gather_into_tensor = all_gather_into_tensor
+        dist.reduce_scatter_tensor = reduce_scatter_tensor
+        dist.all_reduce = all_reduce
+        dist.barrier = barrier
+
+    def _restore_collectives(self):
+        dist.all_gather_into_tensor = (
+            self._collective_saved_methods.all_gather_into_tensor
+        )
+        dist.reduce_scatter_tensor = (
+            self._collective_saved_methods.reduce_scatter_tensor
+        )
+        dist.all_reduce = self._collective_saved_methods.all_reduce
+        dist.barrier = self._collective_saved_methods.barrier
+
     def _mark_inputs(self):
         if self.inputs is not None:
 
             def _track_inputs(t: torch.Tensor):
-                st = t.untyped_storage()
-                winfo = self.WINFO.get(st, None)
-                if winfo is None:
-                    winfo = _WeakRefInfo(
-                        st.size(), st.element_size(), _RefType.inputs
-                    )
-                    self.WINFO[st] = winfo
+                self._update_and_maybe_create_winfo(t, _RefType.inputs)
 
             tree_map_only(torch.Tensor, _track_inputs, self.inputs)
 
     def __enter__(self):
         self._register_module_and_optimizer_hooks()
         self._mark_inputs()
+        self._IN_FAKE_MODE = True if active_fake_mode() else False
+        self._instrument_and_maybe_bypass_collectives()
         super().__enter__()
         return self
 
@@ -447,6 +523,7 @@ class MemoryTrackingMode(TorchDispatchMode):
         if self.display_modulewise_stats:
             self._display_mem_stats()
         self._deregister_module_and_optimizer_hooks()
+        self._restore_collectives()
         super().__exit__(*args)
 
     def __torch_dispatch__(self, func, types, args=..., kwargs=None):

@@ -6,7 +6,7 @@ import torch.distributed as dist
 import torch.distributed._composable.fsdp
 from torch._C._distributed_c10d import ProcessGroup, Work
 from torch.futures import Future
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from torch.testing._internal.distributed.fake_pg import FakeStore
 from torch._subclasses.fake_tensor import FakeTensorMode, FakeTensor
 from torch.utils._python_dispatch import TorchDispatchMode
@@ -30,7 +30,8 @@ class IgnoreDistMode(TorchDispatchMode):
             logging.info(type(func))
             logging.info(func)
             logging.info(f"Arg types: {[type(arg) for arg in args]}")
-
+            logging.info(f"Arg 0 size: {args[0].size()}")
+            logging.info(f"Arg 1 size: {args[1].size()}")
             logging.info(f"Torch Script Inp Obj: {ProcessGroup.unbox(args[2])}")
             # func = torch.ops._c10d_functional.all_gather_into_tensor.default
             res = func(*args, **kwargs or {})
@@ -43,6 +44,10 @@ class IgnoreDistMode(TorchDispatchMode):
             work = Work.unbox(res[1])
             logging.info(f"Torch Script Op Obj: {work.__dir__()}")
             logging.info(f"Future: {work.get_future().__dir__()}")
+            logging.info(f"Future value: {work.get_future().value()}")
+            logging.info(f"Future done: {work.get_future().done()}")
+            logging.info(f"Future value type: {type(work.get_future().value())}")
+            logging.info(f"Future value size: {work.get_future().value()[0].size()}")
             # logging.info(f"Tensor Size: {res[0].size()}")
 
         # if isinstance(res, torch.Tensor):
@@ -55,6 +60,10 @@ class IgnoreDistMode(TorchDispatchMode):
 
 
 class FakeWork(Work):
+
+    def __init__(self):
+        super().__init__()
+
     def get_future(self) -> Future:
         future = Future()
         future.set_result(None)
@@ -64,8 +73,9 @@ class FakeWork(Work):
         return True
 
 
-def all_gather_into_tensor(out_tensor: torch.Tensor, in_tensor: torch.Tensor):
-    # work = FakeWork()
+def all_gather_into_tensor(out_tensor: torch.Tensor, in_tensor: torch.Tensor, group=None, async_op=False):
+    if async_op:
+        return FakeWork()
     return None
 
 
@@ -86,22 +96,37 @@ def run_worker(rank, world_size):
     )
     # logging.getLogger().setLevel(logging.DEBUG)
     store = FakeStore()
+    # dist.init_process_group(
+    #     "fake", rank=rank, world_size=world_size, store=store
+    # )
     dist.init_process_group(
-        "fake", rank=rank, world_size=world_size, store=store
+        "nccl", rank=rank, world_size=world_size
     )
     logging.info(f"Number of visible devices:  {torch.cuda.device_count()}")
     torch.cuda.set_device(rank)
 
-    with FakeTensorMode() as fake_mode:
-        with bypass_collectives():
-            with IgnoreDistMode():
+    # with FakeTensorMode() as fake_mode:
+    with nullcontext():
+        with IgnoreDistMode():
 
-                test_tensor = torch.randn(100, device="cuda")
-                output_tensor = torch.empty(
-                    test_tensor.numel() * world_size, device="cuda"
-                )
-                # all_gather_tensor_inplace(output_tensor, test_tensor, dist.group.WORLD)
-                dist.all_gather_into_tensor(output_tensor, test_tensor)
+            test_tensor = torch.randn(10000, device="cuda")
+            output_tensor = torch.empty(
+                test_tensor.numel() * world_size, device="cuda"
+            )
+            # all_gather_tensor_inplace(output_tensor, test_tensor, dist.group.WORLD)
+            work = dist.all_gather_into_tensor(output_tensor, test_tensor, None, True)
+
+            if work is not None:
+                if rank == 0:
+                    print(type(work))
+                    future = work.get_future()
+                    print(future.done())
+                    print(type(future.value()))
+                    print(future.value()[0].size())
+                    print(future.value()[0].untyped_storage() == output_tensor.untyped_storage())
+                print(work.wait())
+    dist.barrier()
+    dist.destroy_process_group()
 
 
 if __name__ == "__main__":

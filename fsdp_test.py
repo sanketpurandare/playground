@@ -14,6 +14,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed._composable import checkpoint
+from torch.distributed._composable.fsdp import FSDP
 from mem_tracker import MemoryTrackingMode
 from torch.distributed._composable.fsdp import (
     fully_shard,
@@ -221,12 +222,15 @@ def test_memory_tracking(
     config = GPTConfig(block_size=2048, n_layer=n_layer, vocab_size=vocab_size)
 
     model = meta_init_model(config)
+    if rank == 0:
+        print(f"peak active before model init: {torch.cuda.memory_allocated()/1024**2} MB")
     model = apply_fsdp_wrapping(
         model, use_activation_checkpoint, use_cpu_offload, use_compile
     )
     model.to_empty(device="cuda")
     if rank == 0:
-        print(model)
+        print(f"peak active after model init: {torch.cuda.memory_allocated()/1024**2} MB")
+
     optim = torch.optim.Adam(model.parameters(), lr=1e-2, foreach=True)
     torch.manual_seed(rank + 1)
     bsz, seq_len = 32, 1024
@@ -241,16 +245,19 @@ def test_memory_tracking(
             optim.zero_grad()
             loss = model(*inp)
             loss.backward()
-            optim.step()
+            # optim.step()
         torch.cuda.synchronize()
 
     inner(1)  # Lazy init and Unsharded param init
+    optim.zero_grad()
+    if rank == 0:
+        print(f"peak active after 1st iter: {torch.cuda.memory_allocated()/1024**2} MB")
+    return
     display_modulewise_stats = True if rank == 0 else False
     memory_tracker = MemoryTrackingMode(
         mod=model,
         optm=optim,
         inputs=inp,
-        depth=3,
         display_modulewise_stats=display_modulewise_stats,
         units="MB",
     )
