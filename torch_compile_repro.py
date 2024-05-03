@@ -1,12 +1,12 @@
 """
-torchrun --standalone --nproc_per_node=4 fsdp_test.py
-NCCL_P2P_DISABLE=1 torchrun --standalone --nproc_per_node=4 fsdp_test.py
+torchrun --standalone --nproc_per_node=4 torch_compile_repro.py
+NCCL_P2P_DISABLE=1 torchrun --standalone --nproc_per_node=4 torch_compile_repro.py
 """
 
+from contextlib import nullcontext
 import functools
 import os
 from dataclasses import dataclass
-from contextlib import nullcontext
 from typing import List, Tuple
 
 import torch
@@ -14,7 +14,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed._composable import checkpoint
-from torch.distributed._tools.fsdp2_memory_tracker import MemoryTrackingMode
+from torch.utils._python_dispatch import TorchDispatchMode
 from torch.distributed._composable.fsdp import (
     fully_shard,
     MixedPrecisionPolicy,
@@ -206,6 +206,17 @@ def apply_fsdp_wrapping(
 vocab_size = 50304
 n_layer = 4
 
+
+class MyDispatchMode(TorchDispatchMode):
+
+    def __torch_dispatch__(self, func, types, args=..., kwargs=None):
+        res = func(*args, **kwargs or {})
+        return res
+
+
+USE_DISPATCH = True
+
+
 def test_memory_tracking(
     use_activation_checkpoint: bool,
     use_cpu_offload: bool,
@@ -216,18 +227,21 @@ def test_memory_tracking(
         rank = dist.get_rank()
     except:
         rank = 0
-    # torch.cuda.memory._record_memory_history()
     config = GPTConfig(block_size=2048, n_layer=n_layer, vocab_size=vocab_size)
 
     model = meta_init_model(config)
     if rank == 0:
-        print(f"peak active before model init: {torch.cuda.memory_allocated()/1024**2} MB")
+        print(
+            f"peak active before model init: {torch.cuda.memory_allocated()/1024**2} MB"
+        )
     model = apply_fsdp_wrapping(
         model, use_activation_checkpoint, use_cpu_offload, use_compile
     )
     model.to_empty(device="cuda")
     if rank == 0:
-        print(f"peak active after model init: {torch.cuda.memory_allocated()/1024**2} MB")
+        print(
+            f"peak active after model init: {torch.cuda.memory_allocated()/1024**2} MB"
+        )
 
     optim = torch.optim.Adam(model.parameters(), lr=1e-2, foreach=True)
     torch.manual_seed(rank + 1)
@@ -236,38 +250,28 @@ def test_memory_tracking(
     tgt = torch.randint(0, vocab_size, (bsz, seq_len), device="cuda")
     inp = (src, tgt)
 
+    dist.barrier()
+
     def inner(num_iters: int):
         for _ in range(num_iters):
             optim.zero_grad()
             loss = model(*inp)
             loss.backward()
             optim.step()
+        torch.cuda.synchronize()
 
-    torch.cuda.synchronize()
-    # torch._C._cuda_clearCublasWorkspaces()
     if rank == 0:
-        print(f"peak active after 1st iter: {torch.cuda.memory_allocated()/1024**2} MB")
-    # import pickle
-    # snapshot = torch.cuda.memory._snapshot()
-    # with open(f"snapshot_{dist.get_rank()}.pickle", "wb") as f:
-    #     pickle.dump(snapshot, f)
-
-    display_modulewise_stats = True if rank == 0 else False
-    memory_tracker = MemoryTrackingMode(
-        mod=model,
-        optm=optim,
-        inputs=inp,
-        display_modulewise_stats=display_modulewise_stats,
-        units="MB",
-    )
-    num_iters = 1
-    with memory_tracker:
+        print(
+            f"peak active after 1st iter: {torch.cuda.memory_allocated()/1024**2} MB"
+        )
+    num_iters = 2
+    with MyDispatchMode()if USE_DISPATCH else nullcontext():
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record(torch.cuda.current_stream())
         inner(num_iters)
         end.record(torch.cuda.current_stream())
-    torch.cuda.synchronize()
+
     iter_time = start.elapsed_time(end)
     if rank == 0:
         print(f"Time per iter: {iter_time/num_iters:.3f} ms")
@@ -280,9 +284,6 @@ def test_memory_tracking(
         print(
             f"peak active: {peak_active_gb} GB | peak reserved:"
             f" {peak_reserved_gb} GB | num_retries: {num_retries}"
-        )
-        print(
-            f"Tracker Max: {memory_tracker.get_max_memory() / (1024 ** 3)} GB"
         )
     dist.barrier()
 
@@ -301,7 +302,7 @@ if __name__ == "__main__":
     # use_activation_checkpoint = False
     use_activation_checkpoint = False
     # use_compile = True
-    use_compile = False
+    use_compile = True
     if use_compile:
         import torch._dynamo
 

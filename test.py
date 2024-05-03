@@ -39,6 +39,7 @@ if __name__ == "__main__":
     device = f"cuda:{gpu_id}"
     torch.cuda.set_device(device)
     dist.barrier()
+    torch.cuda.reset_memory_stats()
 
 
 
@@ -51,7 +52,7 @@ if __name__ == "__main__":
 
 
 
-
+    torch.cuda.memory._record_memory_history()
     # dist.init_process_group(backend="nccl")
     # Create a mesh topology with the available devices.
     mesh = DeviceMesh("cuda", list(range(dist.get_world_size())))
@@ -78,6 +79,10 @@ if __name__ == "__main__":
         print(local_tensor.untyped_storage() == my_dtensor.untyped_storage())
         print(big_tensor.untyped_storage() == my_dtensor.untyped_storage())
         print(my_dtensor.placements)
+    import pickle
+    snapshot = torch.cuda.memory._snapshot()
+    with open(f"snapshot_{dist.get_rank()}.pickle", "wb") as f:
+        pickle.dump(snapshot, f)
 
     dist.barrier()
     dist.destroy_process_group()
