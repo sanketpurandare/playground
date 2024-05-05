@@ -1,16 +1,17 @@
-from contextlib import nullcontext
-from os import write
-from typing import Callable
 import time
+from contextlib import nullcontext
+from typing import Callable
+
 import torch
 import torch.utils._pytree as pytree
+from torch._guards import active_fake_mode
+from torch._inductor.utils import get_device_tflops, get_gpu_dram_gbps
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.utils._mode_utils import no_dispatch
 from torch.utils._python_dispatch import TorchDispatchMode
-from torch._guards import active_fake_mode
 from torch.utils.flop_counter import flop_registry
+
 from fsdp_test import GPT, GPTConfig
-from torch._inductor.utils import get_gpu_dram_gbps, get_device_tflops
 
 aten = torch.ops.aten
 
@@ -21,7 +22,7 @@ class EstimateMode(TorchDispatchMode):
         self.fake_mode: FakeTensorMode
         self._dispatch: Callable
         self.estimate_mode_type: str
-        # No fall-back kernel needed for view ops
+        # No fall-back kernel needed/exists for view ops
         self.ignore_ops = {
             aten.lift_fresh,
             aten.t,
@@ -55,6 +56,7 @@ class EstimateMode(TorchDispatchMode):
             aten.swapdims,
             aten.chunk,
         }
+        # We can ignore benchmarking tensor create ops
         self.ignore_ops_extended = {
             aten.randint,
             aten.randn,
@@ -190,13 +192,20 @@ class EstimateMode(TorchDispatchMode):
             if func_packet in flop_registry:
                 assert (
                     len(out_dtypes) == 1
-                ), f"Only support single out dtype got {out_dtypes} for {func_packet}"
+                ), "Only support single out dtype got"
+                f"{out_dtypes} for {func_packet}"
                 dtype = out_dtypes.pop()
-                factor = 1.0
-                gpu_flops = get_device_tflops(dtype) * 1e12
+                # We can expect to achieve 75% of theoretical peak flops
+                factor = 0.75
+                # This actually gives peta flops hence 1e15 instead of 1e12
+                # to get the FLOPs/s
+                gpu_flops = get_device_tflops(dtype) * 1e15
                 flop_count_func = flop_registry[func_packet]
-                flop_count = flop_count_func(*args, **kwargs, out_val=out)
-                compute_time = (factor * flop_count / gpu_flops) * 1e6
+                # We divide by a factor of 2 to get the MACs
+                # (multiply and accumulate)
+                flop_count = flop_count_func(*args, **kwargs, out_val=out) / 2
+                # We multiply by 1e9 to get the time in nano seconds
+                compute_time = (flop_count / (factor * gpu_flops)) * 1e9
                 return compute_time
             return 0.0
 
@@ -212,6 +221,8 @@ class EstimateMode(TorchDispatchMode):
                 if isinstance(t, torch.Tensor)
             )
             counted_bytes = read_bytes + write_bytes
+            # The GPU memory bandwidth is in GB/s so the transfer time
+            # is in nano seconds
             transfer_time = counted_bytes / self.gpu_memory_bandwidth
             return transfer_time
 
@@ -236,8 +247,9 @@ class EstimateMode(TorchDispatchMode):
             compute_time = get_compute_time(
                 func_packet, args, kwargs, out, out_dtypes
             )
-            op_time = compute_time/10**6
-            # op_time = max(transfer_time, compute_time)/10**6
+            # We get the estimated time as the max of the transfer time and
+            # compute time. We divide by 1e6 to get the time in ms
+            op_time = max(transfer_time, compute_time) / 1e6
             self.total_time += op_time
 
         return out
@@ -247,9 +259,9 @@ class EstimateMode(TorchDispatchMode):
         return res
 
     def __call__(self, estimate_mode_type: str):
-        if estimate_mode_type == "benchmark":
+        if estimate_mode_type == "operator-level-benchmark":
             self._dispatch = self._dispatch_benchmark_estimate
-        elif estimate_mode_type == "inductor":
+        elif estimate_mode_type == "operator-level-cost-model":
             self._dispatch = self._dispatch_inductor_estimate
         elif estimate_mode_type == "actual":
             return nullcontext()
@@ -285,23 +297,24 @@ def test(
     estimate_mode_type: str = "actual",
 ):
     if estimate_mode_type == "actual":
-        num_iters = 2
+        warm_up_iters, actual_iters = 1, 2
         maybe_fake_tensor_mode = nullcontext()
     else:
-        num_iters = 1
+        # We just need one actual iteration for estimation
+        warm_up_iters, actual_iters = 1, 1
         maybe_fake_tensor_mode = FakeTensorMode()
 
     with maybe_fake_tensor_mode:
-        n_layer = 16
+        n_layer = 12
         vocab_size = 50304
         config = GPTConfig(
-            block_size=512, n_layer=n_layer, vocab_size=vocab_size
+            block_size=2048, n_layer=n_layer, vocab_size=vocab_size
         )
         with torch.device("cuda"):
             model = GPT(config)
         optim = torch.optim.Adam(model.parameters(), lr=1e-2, foreach=True)
         torch.manual_seed(1)
-        bsz, seq_len = 32, 512
+        bsz, seq_len = 32, 2048
         src = torch.randint(0, vocab_size, (bsz, seq_len), device="cuda")
         tgt = torch.randint(0, vocab_size, (bsz, seq_len), device="cuda")
         inp = (src, tgt)
@@ -313,7 +326,8 @@ def test(
                 loss.backward()
                 optim.step()
 
-        inner(1)  # Initializing optimizer states
+        # Initializing optimizer states and warm-up
+        inner(warm_up_iters)
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
 
@@ -321,18 +335,17 @@ def test(
         end = torch.cuda.Event(enable_timing=True)
         with estimate_mode(estimate_mode_type=estimate_mode_type):
             start.record(torch.cuda.current_stream())
-            inner(num_iters)
+            inner(actual_iters)
             end.record(torch.cuda.current_stream())
         torch.cuda.synchronize()
 
         iter_time = start.elapsed_time(end)
 
         if estimate_mode_type == "actual":
-            print(f"Actual run_time : {iter_time/num_iters:.3f} ms")
+            print(f"Actual run_time : {iter_time/actual_iters:.3f} ms")
         else:
-            print(
-                f"Estimation process total_time: {iter_time/num_iters:.3f} ms"
-            )
+            # We use only one iteration for estimation
+            print(f"Estimation process total_time: {iter_time:.3f} ms")
 
         mem_stats = torch.cuda.memory_stats()
         peak_active_gb = mem_stats["active_bytes.all.peak"] / (1024**3)
@@ -346,6 +359,6 @@ def test(
 if __name__ == "__main__":
 
     estimate_mode = EstimateMode()
-    test(estimate_mode, estimate_mode_type="inductor")
+    test(estimate_mode, estimate_mode_type="operator-level-cost-model")
+    test(estimate_mode, estimate_mode_type="operator-level-benchmark")
     test(estimate_mode, estimate_mode_type="actual")
-    test(estimate_mode, estimate_mode_type="benchmark")
