@@ -195,8 +195,8 @@ class EstimateMode(TorchDispatchMode):
                 ), f"Only support single out dtype got {out_dtypes}"
                 f"{out_dtypes} for {func_packet}"
                 dtype = out_dtypes.pop()
-                # We can expect to achieve 75% of theoretical peak flops
-                factor = 0.9
+                # We can expect to achieve 80% of theoretical peak flops
+                factor = 0.80
                 # This actually gives peta-FLOPs/s hence multiply by 1e15
                 # instead of 1e12 to get the FLOPs/s
                 gpu_flops = get_device_tflops(dtype) * 1e15
