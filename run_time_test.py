@@ -78,7 +78,7 @@ class EstimateMode(TorchDispatchMode):
         }
         self.no_fallback_kernel = set()
         self.total_time: float = 0.0
-
+    # Adapted from: https://github.com/pytorch/pytorch/blob/main/torch/_subclasses/fake_tensor.py#L1838
     # NB: returns fake tensors
     def _maybe_run_and_benchmark_fallback_kernel(
         self,
@@ -114,7 +114,7 @@ class EstimateMode(TorchDispatchMode):
             flat_args = [to_real_tensor(a) for a in flat_args]
             args, kwargs = pytree.tree_unflatten(flat_args, args_spec)
             r = func(*args, **kwargs)
-            num_iters = 2
+            num_iters = 3
             start_event = torch.cuda.Event(enable_timing=True)
             end_event = torch.cuda.Event(enable_timing=True)
             cpu_start = time.time()
@@ -181,7 +181,7 @@ class EstimateMode(TorchDispatchMode):
                 self.no_fallback_kernel.add(func._overloadpacket)
         res = func(*args, **kwargs or {})
         return res
-
+    # Adapted from: https://github.com/pytorch/pytorch/blob/main/torch/_inductor/scheduler.py#L563
     def _dispatch_inductor_estimate(self, func, args, kwargs):
         def get_num_bytes(t: torch.Tensor) -> int:
             st = t.untyped_storage()
@@ -192,13 +192,13 @@ class EstimateMode(TorchDispatchMode):
             if func_packet in flop_registry:
                 assert (
                     len(out_dtypes) == 1
-                ), "Only support single out dtype got"
+                ), f"Only support single out dtype got {out_dtypes}"
                 f"{out_dtypes} for {func_packet}"
                 dtype = out_dtypes.pop()
                 # We can expect to achieve 75% of theoretical peak flops
-                factor = 0.75
-                # This actually gives peta flops hence 1e15 instead of 1e12
-                # to get the FLOPs/s
+                factor = 0.9
+                # This actually gives peta-FLOPs/s hence multiply by 1e15
+                # instead of 1e12 to get the FLOPs/s
                 gpu_flops = get_device_tflops(dtype) * 1e15
                 flop_count_func = flop_registry[func_packet]
                 # We divide by a factor of 2 to get the MACs
@@ -223,7 +223,7 @@ class EstimateMode(TorchDispatchMode):
             counted_bytes = read_bytes + write_bytes
             # The GPU memory bandwidth is in GB/s so the transfer time
             # is in nano seconds
-            transfer_time = counted_bytes / self.gpu_memory_bandwidth
+            transfer_time = (counted_bytes / self.gpu_memory_bandwidth)
             return transfer_time
 
         kwargs = kwargs if kwargs else {}
@@ -305,16 +305,16 @@ def test(
         maybe_fake_tensor_mode = FakeTensorMode()
 
     with maybe_fake_tensor_mode:
-        n_layer = 12
+        n_layer = 6
         vocab_size = 50304
         config = GPTConfig(
-            block_size=2048, n_layer=n_layer, vocab_size=vocab_size
+            block_size=4096, n_layer=n_layer, vocab_size=vocab_size
         )
         with torch.device("cuda"):
             model = GPT(config)
         optim = torch.optim.Adam(model.parameters(), lr=1e-2, foreach=True)
         torch.manual_seed(1)
-        bsz, seq_len = 32, 2048
+        bsz, seq_len = 16, 4096
         src = torch.randint(0, vocab_size, (bsz, seq_len), device="cuda")
         tgt = torch.randint(0, vocab_size, (bsz, seq_len), device="cuda")
         inp = (src, tgt)
@@ -322,7 +322,7 @@ def test(
         def inner(num_iters: int):
             for _ in range(num_iters):
                 optim.zero_grad()
-                loss = model(*inp)
+                loss = model(*inp).sum()
                 loss.backward()
                 optim.step()
 
