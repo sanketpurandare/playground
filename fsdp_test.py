@@ -5,165 +5,23 @@ NCCL_P2P_DISABLE=1 torchrun --standalone --nproc_per_node=4 fsdp_test.py
 
 import functools
 import os
-from dataclasses import dataclass
 from contextlib import nullcontext
-from typing import List, Tuple
 
 import torch
 import torch.distributed as dist
+from torch.distributed.device_mesh import init_device_mesh, DeviceMesh
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.distributed._composable import checkpoint
-from torch.distributed._tools.fsdp2_memory_tracker import MemoryTrackingMode
+from torch.distributed._tools.fsdp2_memory_tracker import FSDPMemTracker
 from torch.distributed._composable.fsdp import (
     fully_shard,
     MixedPrecisionPolicy,
-    OffloadPolicy,
 )
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     apply_activation_checkpointing,
 )
 from torch.distributed.fsdp.wrap import ModuleWrapPolicy
-
-
-# NOTE: We take the GPT2 implementation from nanoGPT: https://github.com/karpathy/nanoGPT
-class CausalSelfAttention(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-        self.c_attn = nn.Linear(
-            config.n_embd, 3 * config.n_embd, bias=config.bias
-        )
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.dropout = config.dropout
-
-    def forward(self, x):
-        (B, T, C) = x.size()
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        y = torch.nn.functional.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            dropout_p=self.dropout if self.training else 0,
-            is_causal=True,
-        )
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        y = self.resid_dropout(self.c_proj(y))
-        return y
-
-
-class GPTMLP(nn.Module):  # renamed to avoid name conflict
-    def __init__(self, config):
-        super().__init__()
-        self.c_fc = nn.Linear(
-            config.n_embd, 4 * config.n_embd, bias=config.bias
-        )
-        self.gelu = nn.GELU()
-        self.c_proj = nn.Linear(
-            4 * config.n_embd, config.n_embd, bias=config.bias
-        )
-        self.dropout = nn.Dropout(config.dropout)
-
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
-        x = self.dropout(x)
-        return x
-
-
-class Block(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.ln_1 = nn.LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
-        self.ln_2 = nn.LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = GPTMLP(config)
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-                if module.bias is not None:
-                    torch.nn.init.zeros_(module.bias)
-
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
-        return x
-
-
-@dataclass
-class GPTConfig:
-    block_size: int = 1024
-    vocab_size: int = 50304
-    n_layer: int = 12
-    n_head: int = 12
-    n_embd: int = 768
-    dropout: float = 0.0
-    bias: bool = True
-    checkpoint_activations: bool = False
-
-
-class GPT(nn.Module):
-    def __init__(self, config: GPTConfig):
-        super().__init__()
-        assert config.vocab_size is not None
-        assert config.block_size is not None
-        self.config = config
-
-        wte = nn.Embedding(config.vocab_size, config.n_embd)
-        wpe = nn.Embedding(config.block_size, config.n_embd)
-        torch.nn.init.normal_(wte.weight, mean=0.0, std=0.02)
-        torch.nn.init.normal_(wpe.weight, mean=0.0, std=0.02)
-        blocks: List[Block] = []
-        for _ in range(config.n_layer):
-            block = Block(config)
-            blocks.append(block)
-        self.transformer = nn.ModuleDict(
-            dict(
-                wte=wte,
-                wpe=wpe,
-                drop=nn.Dropout(config.dropout),
-                h=nn.ModuleList(blocks),
-                ln_f=nn.LayerNorm(config.n_embd, bias=config.bias),
-            )
-        )
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.lm_head.weight = self.transformer.wte.weight
-
-    def forward(
-        self, idx: torch.Tensor, targets: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        device = idx.device
-        b, t = idx.size()
-        assert (
-            t <= self.config.block_size
-        ), f"Supports at most {self.config.block_size} but got {t}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device)
-        tok_emb = self.transformer.wte(idx)
-        pos_emb = self.transformer.wpe(pos)
-        x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
-            if self.config.checkpoint_activations:
-                # We only support composition with non-reentrant AC
-                x = torch.utils.checkpoint.checkpoint(
-                    block, x, use_reentrant=False
-                )
-            else:
-                x = block(x)
-        x = self.transformer.ln_f(x)
-        logits = self.lm_head(x)
-        loss = F.cross_entropy(
-            logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
-        )
-        return loss
+from test_model import GPT, GPTConfig, Block
 
 
 def meta_init_model(config: GPTConfig) -> nn.Module:
@@ -178,9 +36,11 @@ def apply_fsdp_wrapping(
     use_activation_checkpoint: bool,
     use_cpu_offload: bool,
     use_compile: bool,
+    mesh: DeviceMesh
 ):
     param_dtype = torch.bfloat16
-    mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype)
+    reduce_dtype = torch.float32
+    mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
     # offload_policy = OffloadPolicy("cpu" if use_cpu_offload else None)
     if use_activation_checkpoint and use_compile:
         apply_activation_checkpointing(
@@ -188,7 +48,9 @@ def apply_fsdp_wrapping(
         )
     fully_shard_fn = functools.partial(
         fully_shard,
-        mp_policy=mp_policy,  # offload_policy=offload_policy
+        mp_policy=mp_policy,
+        mesh=mesh,
+        # offload_policy=offload_policy
     )
     for i, module in enumerate(model.transformer.h):
         if use_compile:
@@ -206,10 +68,12 @@ def apply_fsdp_wrapping(
 vocab_size = 50304
 n_layer = 4
 
+
 def test_memory_tracking(
     use_activation_checkpoint: bool,
     use_cpu_offload: bool,
     use_compile: bool,
+    mesh: DeviceMesh,
 ):
 
     try:
@@ -223,7 +87,7 @@ def test_memory_tracking(
     if rank == 0:
         print(f"peak active before model init: {torch.cuda.memory_allocated()/1024**2} MB")
     model = apply_fsdp_wrapping(
-        model, use_activation_checkpoint, use_cpu_offload, use_compile
+        model, use_activation_checkpoint, use_cpu_offload, use_compile, mesh
     )
     model.to_empty(device="cuda")
     if rank == 0:
@@ -253,12 +117,13 @@ def test_memory_tracking(
     #     pickle.dump(snapshot, f)
 
     display_modulewise_stats = True if rank == 0 else False
-    memory_tracker = MemoryTrackingMode(
+    memory_tracker = FSDPMemTracker(
         mod=model,
         optm=optim,
         inputs=inp,
         display_modulewise_stats=display_modulewise_stats,
         units="MB",
+        display_peak_stats=False
     )
     num_iters = 1
     with memory_tracker:
@@ -282,7 +147,7 @@ def test_memory_tracking(
             f" {peak_reserved_gb} GB | num_retries: {num_retries}"
         )
         print(
-            f"Tracker Max: {memory_tracker.get_max_memory() / (1024 ** 3)} GB"
+            f"Tracker Max: {memory_tracker.get_peak_memory() / (1024 ** 3)} GB"
         )
     dist.barrier()
 
@@ -291,15 +156,24 @@ if __name__ == "__main__":
     try:
         dist.init_process_group(backend="nccl")
         gpu_id = int(os.environ["LOCAL_RANK"])
-    except:  # assume single GPU
+        world_size = int(os.environ["WORLD_SIZE"])
+        dims = (world_size,)
+        names = ("dp",)
+        world_mesh = init_device_mesh("cuda", dims, mesh_dim_names=names)
+    except:
+        world_mesh = DeviceMesh("cuda", [1])
         gpu_id = 0
+        world_size = 1
+    if gpu_id == 0:
+        print(f"world_size: {world_size}")
+        print(f"world_mesh: {world_mesh}")
     device = f"cuda:{gpu_id}"
     torch.cuda.set_device(device)
     # TODO: Use argparse for the different args plus profiler / memory trace.
     # use_cpu_offload = True
     use_cpu_offload = False
     # use_activation_checkpoint = False
-    use_activation_checkpoint = False
+    use_activation_checkpoint = True
     # use_compile = True
     use_compile = False
     if use_compile:
@@ -307,7 +181,7 @@ if __name__ == "__main__":
 
         torch._dynamo.config.cache_size_limit = n_layer + 2
     test_memory_tracking(
-        use_activation_checkpoint, use_cpu_offload, use_compile
+        use_activation_checkpoint, use_cpu_offload, use_compile, world_mesh,
     )
     try:
         dist.destroy_process_group()

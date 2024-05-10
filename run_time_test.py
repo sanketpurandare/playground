@@ -11,7 +11,7 @@ from torch.utils._mode_utils import no_dispatch
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils.flop_counter import flop_registry
 
-from fsdp_test import GPT, GPTConfig
+from test_model import GPT, GPTConfig
 
 aten = torch.ops.aten
 
@@ -80,6 +80,7 @@ class EstimateMode(TorchDispatchMode):
         self.total_time: float = 0.0
     # Adapted from: https://github.com/pytorch/pytorch/blob/main/torch/_subclasses/fake_tensor.py#L1838
     # NB: returns fake tensors
+
     def _maybe_run_and_benchmark_fallback_kernel(
         self,
         func,
@@ -182,6 +183,7 @@ class EstimateMode(TorchDispatchMode):
         res = func(*args, **kwargs or {})
         return res
     # Adapted from: https://github.com/pytorch/pytorch/blob/main/torch/_inductor/scheduler.py#L563
+
     def _dispatch_inductor_estimate(self, func, args, kwargs):
         def get_num_bytes(t: torch.Tensor) -> int:
             st = t.untyped_storage()
@@ -308,13 +310,13 @@ def test(
         n_layer = 6
         vocab_size = 50304
         config = GPTConfig(
-            block_size=4096, n_layer=n_layer, vocab_size=vocab_size
+            block_size=2048, n_layer=n_layer, vocab_size=vocab_size
         )
         with torch.device("cuda"):
             model = GPT(config)
         optim = torch.optim.Adam(model.parameters(), lr=1e-2, foreach=True)
         torch.manual_seed(1)
-        bsz, seq_len = 16, 4096
+        bsz, seq_len = 16, 2048
         src = torch.randint(0, vocab_size, (bsz, seq_len), device="cuda")
         tgt = torch.randint(0, vocab_size, (bsz, seq_len), device="cuda")
         inp = (src, tgt)
