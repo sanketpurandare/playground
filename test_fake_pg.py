@@ -1,17 +1,20 @@
 from datetime import timedelta
 import torch
 import os
+from datetime import timedelta
 import torch.multiprocessing as mp
 import torch.distributed as dist
 import torch.distributed._composable.fsdp
 from torch._C._distributed_c10d import ProcessGroup, Work
 from torch.futures import Future
+from functools import wraps
 from contextlib import contextmanager, nullcontext
 from torch.testing._internal.distributed.fake_pg import FakeStore
 from torch._subclasses.fake_tensor import FakeTensorMode, FakeTensor
 from torch.utils._python_dispatch import TorchDispatchMode
 import logging
-
+from typing import Optional, Callable, NamedTuple
+from torch._guards import active_fake_mode
 aten = torch.ops.aten
 from torch.distributed._functional_collectives import all_gather_tensor_inplace
 import torch.distributed._functional_collectives_impl as func_col_impl
@@ -20,7 +23,7 @@ func_col_impl._use_native_funcol = True
 
 
 class IgnoreDistMode(TorchDispatchMode):
-    def __torch_dispatch__(self, func, types, args=..., kwargs=None):
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         logging.info(str(func.__name__))
         logging.info(type(func))
         logging.info(func)
@@ -59,35 +62,103 @@ class IgnoreDistMode(TorchDispatchMode):
         return res
 
 
-class FakeWork(Work):
-
-    def __init__(self):
-        super().__init__()
-
-    def get_future(self) -> Future:
-        future = Future()
-        future.set_result(None)
-        return future
-
-    def wait(self, timeout: timedelta = ...) -> bool:
-        return True
-
-
-def all_gather_into_tensor(out_tensor: torch.Tensor, in_tensor: torch.Tensor, group=None, async_op=False):
-    if async_op:
-        return FakeWork()
-    return None
 
 
 @contextmanager
 def bypass_collectives():
-    saved_all_gather = dist.all_gather_into_tensor
+    class _SavedCollectives(NamedTuple):
+        all_gather_into_tensor: Callable
+        reduce_scatter_tensor: Callable
+        all_reduce: Callable
+        barrier: Callable
+
+    saved_collectives = _SavedCollectives(
+        dist.all_gather_into_tensor,
+        dist.reduce_scatter_tensor,
+        dist.all_reduce,
+        dist.barrier,
+    )
+    in_fake_mode = bool(active_fake_mode())
+
+    class FakeWork(Work):
+        def __init__(self):
+            super().__init__()
+
+        def get_future(self) -> Future:
+            future: Future = Future()
+            future.set_result(None)
+            return future
+
+        def wait(self, timeout: Optional[timedelta] = None) -> bool:
+            return True
+
+    @wraps(dist.all_gather_into_tensor)
+    def all_gather_into_tensor(
+        output_tensor: torch.Tensor,
+        input_tensor: torch.Tensor,
+        group=None,
+        async_op=False,
+    ):
+        if in_fake_mode:
+            if async_op:
+                return FakeWork()
+            return None
+        else:
+            if async_op:
+                return saved_collectives.all_gather_into_tensor(
+                    output_tensor, input_tensor, group, async_op
+                )
+
+    @wraps(dist.reduce_scatter_tensor)
+    def reduce_scatter_tensor(
+        output: torch.Tensor,
+        input: torch.Tensor,
+        op=dist.ReduceOp.SUM,
+        group=None,
+        async_op=False,
+    ):
+
+        if in_fake_mode:
+            if async_op:
+                return FakeWork()
+            return None
+        else:
+            return saved_collectives.reduce_scatter_tensor(
+                output, input, op, group, async_op
+            )
+
+    @wraps(dist.all_reduce)
+    def all_reduce(
+        tensor: torch.Tensor,
+        op=dist.ReduceOp.SUM,
+        group=None,
+        async_op=False,
+    ):
+        if in_fake_mode:
+            if async_op:
+                return FakeWork()
+            return None
+        else:
+            return saved_collectives.all_reduce(tensor, op, group, async_op)
+
+    @wraps(dist.barrier)
+    def barrier(group=dist.GroupMember.WORLD, async_op=False, device_ids=None):
+        if in_fake_mode:
+            return None
+        else:
+            return saved_collectives.barrier(group, async_op, device_ids)
 
     try:
         dist.all_gather_into_tensor = all_gather_into_tensor
+        dist.reduce_scatter_tensor = reduce_scatter_tensor
+        dist.all_reduce = all_reduce
+        dist.barrier = barrier
         yield
     finally:
-        dist.all_gather_into_tensor = saved_all_gather
+        dist.all_gather_into_tensor = saved_collectives.all_gather_into_tensor
+        dist.reduce_scatter_tensor = saved_collectives.reduce_scatter_tensor
+        dist.all_reduce = saved_collectives.all_reduce
+        dist.barrier = saved_collectives.barrier
 
 
 def run_worker(rank, world_size):

@@ -1,0 +1,5 @@
+[flake8]
+# NOTE: **Mirror any changes** to this file the [tool.ruff] config in pyproject.toml
+# before we can fully move to use ruff
+enable-extensions = G
+max-line-length = 120

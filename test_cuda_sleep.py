@@ -69,9 +69,12 @@ if __name__ ==  "__main__":
     torch.cuda.set_device(0)
     s2 = torch.cuda.Stream()
     s1 = torch.cuda.current_stream()
-    a = torch.randn(1000, 10000, device="cuda", dtype=torch.float32)
-    b = torch.randn(10000, 1000, device="cuda", dtype=torch.float32)
-    cycles = 1000000
+    m = 2000
+    k = 10000
+    n = 1000
+    a = torch.randn(m, k, device="cuda", dtype=torch.float32)
+    b = torch.randn(k, n, device="cuda", dtype=torch.float32)
+    cycles = 10 ** 6
     print(measure_sleep(10, 5, cycles, s2))
     print(measure_mm(10, 5, a, b, s1))
     print(measure_mm_sleep(10, 5, a, b, cycles, s1, s2))

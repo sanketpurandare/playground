@@ -197,8 +197,8 @@ class EstimateMode(TorchDispatchMode):
                 ), f"Only support single out dtype got {out_dtypes}"
                 f"{out_dtypes} for {func_packet}"
                 dtype = out_dtypes.pop()
-                # We can expect to achieve 80% of theoretical peak flops
-                factor = 0.80
+                # We can expect to achieve 75% of theoretical peak flops
+                factor = 0.75
                 # This actually gives peta-FLOPs/s hence multiply by 1e15
                 # instead of 1e12 to get the FLOPs/s
                 gpu_flops = get_device_tflops(dtype) * 1e15
@@ -307,16 +307,18 @@ def test(
         maybe_fake_tensor_mode = FakeTensorMode()
 
     with maybe_fake_tensor_mode:
-        n_layer = 6
+        n_layer = 10
         vocab_size = 50304
         config = GPTConfig(
             block_size=2048, n_layer=n_layer, vocab_size=vocab_size
         )
+        if estimate_mode_type == "operator-level-cost-model":
+            print(config)
         with torch.device("cuda"):
             model = GPT(config)
         optim = torch.optim.Adam(model.parameters(), lr=1e-2, foreach=True)
         torch.manual_seed(1)
-        bsz, seq_len = 16, 2048
+        bsz, seq_len = 128, 512
         src = torch.randint(0, vocab_size, (bsz, seq_len), device="cuda")
         tgt = torch.randint(0, vocab_size, (bsz, seq_len), device="cuda")
         inp = (src, tgt)
