@@ -119,7 +119,7 @@ class GPT(nn.Module):
         self.lm_head.weight = self.transformer.wte.weight
 
     def forward(
-        self, idx: torch.Tensor, targets: torch.Tensor
+        self, idx: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         device = idx.device
         b, t = idx.size()
@@ -140,7 +140,10 @@ class GPT(nn.Module):
                 x = block(x)
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
-        loss = F.cross_entropy(
-            logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
-        )
-        return loss
+        return logits
+    
+def loss_fn(logits: torch.Tensor, targets: torch.Tensor):
+    loss = F.cross_entropy(
+        logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
+    )
+    return loss

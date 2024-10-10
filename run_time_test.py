@@ -11,7 +11,7 @@ from torch.utils._mode_utils import no_dispatch
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils.flop_counter import flop_registry
 
-from test_model import GPT, GPTConfig
+from test_model import GPT, GPTConfig, loss_fn
 
 aten = torch.ops.aten
 
@@ -308,7 +308,7 @@ def test(
 
     with maybe_fake_tensor_mode:
         n_layer = 10
-        vocab_size = 50304
+        vocab_size = 8192
         config = GPTConfig(
             block_size=2048, n_layer=n_layer, vocab_size=vocab_size
         )
@@ -326,7 +326,7 @@ def test(
         def inner(num_iters: int):
             for _ in range(num_iters):
                 optim.zero_grad()
-                loss = model(*inp).sum()
+                loss = model(src).sum()
                 loss.backward()
                 optim.step()
 

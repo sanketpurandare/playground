@@ -45,6 +45,8 @@ class MyDispatchMode(TorchDispatchMode):
 
     def __torch_dispatch__(self, func, types, args=..., kwargs=None):
         kwargs = kwargs or {}
+        print(self.mod_tracker.parents)
+        print(func.__name__)
         pass_type = "bw" if self.mod_tracker.is_bw else "fw"      
         for mod_name in self.mod_tracker.parents:
             self.mod_functions.setdefault(mod_name, {"fw": [], "bw": []})
@@ -58,8 +60,8 @@ if __name__ == "__main__":
     with MyDispatchMode() as md:
         my_mod(inp).sum().backward()
 
-    print("Fw execution order: ", md.pre_fw_order)
-    print("Bw execution order: ", md.pre_bw_order)
-    for mod_name, functions in md.mod_functions.items():
-        print(mod_name)
-        print(functions) 
+    # print("Fw execution order: ", md.pre_fw_order)
+    # print("Bw execution order: ", md.pre_bw_order)
+    #  for mod_name, functions in md.mod_functions.items():
+    #     print(mod_name)
+    #     print(functions)
