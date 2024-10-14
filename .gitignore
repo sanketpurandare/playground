@@ -1,2 +1,4 @@
 __pycache__
 *.code-workspace
+tradeoff_graphs
+torch_compile_debug

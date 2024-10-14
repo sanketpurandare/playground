@@ -314,3 +314,16 @@ if __name__ == "__main__":
         dist.destroy_process_group()
     except:
         pass
+
+    def test_fn():
+        a = torch.randn(100, device="cuda")
+        w1 = torch.randn(128, 100, device="cuda")
+        w2 = torch.randn(256, 100, device="cuda")
+
+        b = torch.cos(a)
+        c = torch.sin(a)
+
+        d = torch.mm(w1, b)
+        e = torch.mm(w2, c)
+
+        return torch.mm(d, e)
