@@ -13,6 +13,7 @@ from datetime import timedelta
 from typing import cast, Optional, overload
 
 
+
 class FakeWork(Work):
     def __init__(self):
         super().__init__()
@@ -62,7 +63,7 @@ class IgnoreDistMode(TorchDispatchMode):
             # func = torch.ops._c10d_functional.all_gather_into_tensor.default
             res = func(*args, **kwargs or {})
             # res = all_gather_tensor_inplace(args[0], args[1], ProcessGroup.unbox(args[2]))
-        elif func == torch.ops.c10d.allreduce_.default:
+        elif func == torch.ops.c10d.allreduce_.default or func == torch.ops._c10d_functional.all_reduce.default:
             logging.info(f'Function name: {str(func.__name__)}')
             logging.info(f'Function type: {type(func)}')
             logging.info(f'Func: {func}')
@@ -110,12 +111,13 @@ def run_test():
         with IgnoreDistMode():
 
             test_tensor = torch.randn(10000, device="cuda")
+            test_tensor.untyped_storage().nbytes()
             output_tensor = torch.empty(
                 test_tensor.numel() * world_size, device="cuda"
             )
             # work = all_gather_tensor(output_tensor, test_tensor, dist.group.WORLD)
             # work = dist.all_gather_into_tensor(output_tensor, test_tensor, None, True)
-            # res = all_reduce(test_tensor, reduceOp="avg", group=dist.group.WORLD)
+            res = all_reduce(test_tensor, reduceOp="avg", group=dist.group.WORLD)
             # res = res.wait()
             # print(res.untyped_storage().data_ptr()==test_tensor.untyped_storage().data_ptr())
             work = dist.all_reduce(test_tensor)
