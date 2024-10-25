@@ -51,6 +51,7 @@ class IgnoreDistMode(TorchDispatchMode):
         logging.info(f'Func: {func}')
 
         res = func(*args, **kwargs or {})
+        logging.info(f"Res Type: {type(res)}")
         return res
 
 def run_test():
@@ -62,15 +63,22 @@ def run_test():
         logging.DEBUG if rank == 0 else logging.CRITICAL
     )
 
-    # with nullcontext():
-    with FakeTensorMode():
+    with nullcontext():
+    # with FakeTensorMode():
         with IgnoreDistMode():
 
             test_tensor = torch.randn(10000, device="cuda")
+            print(f"Memory after init: {torch.cuda.memory_allocated()}")
             output = all_reduce(test_tensor, reduceOp="avg", group=dist.group.WORLD)
-            
-
-            dist.all_reduce(test_tensor)
+            print(f"Memory after allreduce: {torch.cuda.memory_allocated()}")
+            print(isinstance(output, torch.Tensor))
+            print(output.untyped_storage().size())
+            waited_output = output.wait()
+            print(f"Memory after wait: {torch.cuda.memory_allocated()}")
+            print(waited_output.untyped_storage().nbytes())
+            print(output.untyped_storage() == waited_output.untyped_storage())
+            # dist.all_reduce(test_tensor)
+            print(f"Peak Memory: {torch.cuda.max_memory_allocated()}")
         dist.barrier()
 
 

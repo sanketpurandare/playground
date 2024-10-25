@@ -19,7 +19,7 @@ if __name__== "__main__":
     from torch.testing._internal.distributed.fake_pg import FakeStore
     dev = torch.device("cuda:0")
     torch.cuda.set_device(dev)
-    world_size = 4
+    world_size = 64
     store = FakeStore()
     torch.distributed.init_process_group(
         "fake", rank=0, world_size=world_size, store=store
@@ -29,12 +29,13 @@ if __name__== "__main__":
     torch.manual_seed(42)
     use_fake_mode = False
     with FakeTensorMode() if use_fake_mode else nullcontext():
-        vocab_size = 8192
-        bsz, seq_len = 32, 1024
+        vocab_size = 64128
+        bsz, seq_len = 8, 4096
         with torch.device(dev):
             model_args = ModelArgs(
-                n_layers=2,
+                n_layers=16,
                 n_heads=16,
+                dim=8192,
                 vocab_size=vocab_size,
                 max_seq_len=seq_len,
                 dropout_p=0.1,
@@ -78,8 +79,8 @@ if __name__== "__main__":
     mem_stats = torch.cuda.memory_stats()
     tracker_peak = fmt.get_tracker_snapshot("peak")[dev]["Total"]
     cuda_peak_active = mem_stats["active_bytes.all.peak"]
-    fmt.display_modulewise_snapshots(depth=4, units="MiB", tabulate=True)
-    fmt.display_snapshot("peak", units="MiB", tabulate=True)
+    fmt.display_modulewise_snapshots(depth=4, units="GiB", tabulate=True)
+    fmt.display_snapshot("peak", units="GiB", tabulate=True)
     print(
         f"peak active: {cuda_peak_active / (1024**3)} GiB | "
         f"Tracker Max: {tracker_peak / (1024 ** 3)} GiB"
