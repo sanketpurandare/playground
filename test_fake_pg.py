@@ -13,6 +13,7 @@ from torch.testing._internal.distributed.fake_pg import FakeStore
 from torch._subclasses.fake_tensor import FakeTensorMode, FakeTensor
 from torch.utils._python_dispatch import TorchDispatchMode
 import logging
+from torch.distributed.device_mesh import init_device_mesh, DeviceMesh
 from typing import Optional, Callable, NamedTuple
 from torch._guards import active_fake_mode
 aten = torch.ops.aten
@@ -65,20 +66,28 @@ class IgnoreDistMode(TorchDispatchMode):
 
 
 @contextmanager
-def bypass_collectives():
+def bypass_collectives(device_mesh: Optional[DeviceMesh] = None):
     class _SavedCollectives(NamedTuple):
         all_gather_into_tensor: Callable
         reduce_scatter_tensor: Callable
         all_reduce: Callable
         barrier: Callable
+        gather: Callable
+        scatter: Callable
+        broadcast: Callable
 
     saved_collectives = _SavedCollectives(
         dist.all_gather_into_tensor,
         dist.reduce_scatter_tensor,
         dist.all_reduce,
         dist.barrier,
+        dist.gather,
+        dist.scatter,
+        dist.broadcast,
     )
-    in_fake_mode = bool(active_fake_mode())
+    # in_fake_mode = bool(active_fake_mode())
+    in_fake_mode = True
+    print(in_fake_mode)
 
     class FakeWork(Work):
         def __init__(self):
@@ -100,14 +109,11 @@ def bypass_collectives():
         async_op=False,
     ):
         if in_fake_mode:
-            if async_op:
-                return FakeWork()
-            return None
+            return FakeWork() if async_op else None
         else:
-            if async_op:
-                return saved_collectives.all_gather_into_tensor(
-                    output_tensor, input_tensor, group, async_op
-                )
+            return saved_collectives.all_gather_into_tensor(
+                output_tensor, input_tensor, group, async_op
+            )
 
     @wraps(dist.reduce_scatter_tensor)
     def reduce_scatter_tensor(
@@ -117,11 +123,8 @@ def bypass_collectives():
         group=None,
         async_op=False,
     ):
-
         if in_fake_mode:
-            if async_op:
-                return FakeWork()
-            return None
+            return FakeWork() if async_op else None
         else:
             return saved_collectives.reduce_scatter_tensor(
                 output, input, op, group, async_op
@@ -135,9 +138,7 @@ def bypass_collectives():
         async_op=False,
     ):
         if in_fake_mode:
-            if async_op:
-                return FakeWork()
-            return None
+            return FakeWork() if async_op else None
         else:
             return saved_collectives.all_reduce(tensor, op, group, async_op)
 
@@ -148,17 +149,71 @@ def bypass_collectives():
         else:
             return saved_collectives.barrier(group, async_op, device_ids)
 
+    @wraps(dist.gather)
+    def gather(
+        tensor: torch.Tensor,
+        gather_list=None,
+        dst=0,
+        group=None,
+        async_op=False,
+    ):
+        if in_fake_mode:
+            return FakeWork() if async_op else None
+        else:
+            return saved_collectives.gather(tensor, gather_list, dst, group, async_op)
+
+    @wraps(dist.scatter)
+    def scatter(
+        tensor: torch.Tensor,
+        scatter_list=None,
+        src=0,
+        group=None,
+        async_op=False,
+    ):
+        print("Custom Scatter")
+        if in_fake_mode:
+            fake_work = FakeWork()
+            fake_work.__setattr__("getFuture", fake_work.get_future)
+            return fake_work if async_op else None
+        else:
+            return saved_collectives.scatter(tensor, scatter_list, src, group, async_op)
+
+    @wraps(dist.broadcast)
+    def broadcast(
+        tensor: torch.Tensor,
+        src=0,
+        group=None,
+        async_op=False,
+    ):
+        if in_fake_mode:
+            return FakeWork() if async_op else None
+        else:
+            return saved_collectives.broadcast(tensor, src, group, async_op)
+
     try:
         dist.all_gather_into_tensor = all_gather_into_tensor
         dist.reduce_scatter_tensor = reduce_scatter_tensor
         dist.all_reduce = all_reduce
         dist.barrier = barrier
+        dist.gather = gather
+        dist.scatter = scatter
+        dist.broadcast = broadcast
+        if device_mesh is not None:
+            dm_pgs = device_mesh.get_all_groups()
+            for pg in dm_pgs:
+                object.__setattr__(pg, "barrier", barrier)
+                object.__setattr__(pg, "gather", gather)
+                object.__setattr__(pg, "scatter", scatter)
+                object.__setattr__(pg, "broadcast", broadcast)
         yield
     finally:
         dist.all_gather_into_tensor = saved_collectives.all_gather_into_tensor
         dist.reduce_scatter_tensor = saved_collectives.reduce_scatter_tensor
         dist.all_reduce = saved_collectives.all_reduce
         dist.barrier = saved_collectives.barrier
+        dist.gather = saved_collectives.gather
+        dist.scatter = saved_collectives.scatter
+        dist.broadcast = saved_collectives.broadcast
 
 
 def run_worker(rank, world_size):
